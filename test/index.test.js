@@ -27,6 +27,8 @@ const {
   trace,
   propagation
 } = require('@opentelemetry/api')
+const { resourceFromAttributes } = require('@opentelemetry/resources')
+const { ATTR_SERVICE_NAME } = require('@opentelemetry/semantic-conventions')
 
 const { HttpInstrumentation } = require('@opentelemetry/instrumentation-http')
 
@@ -39,6 +41,9 @@ describe('FastifyInstrumentation', () => {
   const memoryExporter = new InMemorySpanExporter()
   const spanProcessor = new SimpleSpanProcessor(memoryExporter)
   const provider = new NodeTracerProvider({
+    resource: resourceFromAttributes({
+      [ATTR_SERVICE_NAME]: 'test-service'
+    }),
     sampler: new AlwaysOnSampler(),
     spanProcessors: [spanProcessor]
   })
@@ -201,7 +206,15 @@ describe('FastifyInstrumentation', () => {
 
       const spans = memoryExporter
         .getFinishedSpans()
-        .filter(span => span.instrumentationLibrary.name === '@fastify/otel')
+        .filter(span =>
+          // Filter for Fastify instrumentation spans only
+          // Different OpenTelemetry contexts use different property names:
+          // - instrumentationLibrary: Manual NodeTracerProvider + manual instrumentation (older API)
+          // - instrumentationScope: NodeSDK auto-registration or newer OpenTelemetry versions (current standard)
+          // - The property name changed in OpenTelemetry spec to better reflect concept scope vs library
+          span.instrumentationLibrary?.name === '@fastify/otel' ||
+          span.instrumentationScope?.name === '@fastify/otel'
+        )
 
       const [end, start] = spans
 
@@ -218,6 +231,15 @@ describe('FastifyInstrumentation', () => {
         'http.route': '/',
         'hook.callback.name': 'anonymous'
       })
+
+      // Verify service name comes from resource configuration
+      assert.equal(start.resource.attributes['service.name'], 'test-service')
+      assert.equal(end.resource.attributes['service.name'], 'test-service')
+
+      // Verify service.name is NOT in span attributes (should only be in resource)
+      assert.equal('service.name' in start.attributes, false)
+      assert.equal('service.name' in end.attributes, false)
+
       assert.equal(response.status, 200)
       assert.equal(await response.text(), 'hello world')
     })
@@ -325,6 +347,15 @@ describe('FastifyInstrumentation', () => {
         'http.route': '/',
         'hook.callback.name': 'helloworld'
       })
+
+      // Verify service name comes from resource configuration
+      assert.equal(start.resource.attributes['service.name'], 'test-service')
+      assert.equal(end.resource.attributes['service.name'], 'test-service')
+
+      // Verify service.name is NOT in span attributes (should only be in resource)
+      assert.equal('service.name' in start.attributes, false)
+      assert.equal('service.name' in end.attributes, false)
+
       assert.equal(end.parentSpanId, start.spanContext().spanId)
       assert.equal(response.status, 200)
       assert.equal(await response.text(), 'hello world')
@@ -821,6 +852,15 @@ describe('FastifyInstrumentation', () => {
         'http.route': '/',
         'hook.callback.name': 'helloworld'
       })
+
+      // Verify service name comes from resource configuration
+      assert.equal(start.resource.attributes['service.name'], 'test-service')
+      assert.equal(end.resource.attributes['service.name'], 'test-service')
+
+      // Verify service.name is NOT in span attributes (should only be in resource)
+      assert.equal('service.name' in start.attributes, false)
+      assert.equal('service.name' in end.attributes, false)
+
       assert.equal(end.parentSpanId, start.spanContext().spanId)
       assert.equal(response.status, 200)
       assert.equal(await response.text(), 'hello world')
@@ -871,6 +911,14 @@ describe('FastifyInstrumentation', () => {
         'http.route': '/',
         'hook.callback.name': 'helloworld'
       })
+      // Verify service name comes from resource configuration (error scenario)
+      assert.equal(start.resource.attributes['service.name'], 'test-service')
+      assert.equal(end.resource.attributes['service.name'], 'test-service')
+
+      // Verify service.name is NOT in span attributes (should only be in resource)
+      assert.equal('service.name' in start.attributes, false)
+      assert.equal('service.name' in end.attributes, false)
+
       assert.equal(end.parentSpanId, start.spanContext().spanId)
       assert.equal(response.status, 500)
       assert.deepStrictEqual(await response.json(), {
@@ -1167,6 +1215,15 @@ describe('FastifyInstrumentation', () => {
           'http.route': '/',
           'hook.callback.name': 'helloworld'
         })
+
+        // Verify service name comes from resource configuration (encapsulated context)
+        assert.equal(start.resource.attributes['service.name'], 'test-service')
+        assert.equal(end.resource.attributes['service.name'], 'test-service')
+
+        // Verify service.name is NOT in span attributes (should only be in resource)
+        assert.equal('service.name' in start.attributes, false)
+        assert.equal('service.name' in end.attributes, false)
+
         assert.equal(end.parentSpanId, start.spanContext().spanId)
         assert.equal(response.status, 200)
         assert.equal(await response.text(), 'hello world')
@@ -1433,6 +1490,50 @@ describe('FastifyInstrumentation', () => {
         })
         assert.equal(response.status, 500)
       })
+    })
+
+    test('should use proper OpenTelemetry service name fallback when no resource configured', async () => {
+      // Create provider without any service name resource configuration
+      // Per OpenTelemetry spec, should fallback to "unknown_service:" + process.executable.name
+      const fallbackExporter = new InMemorySpanExporter()
+      const fallbackProvider = new NodeTracerProvider({
+        spanProcessors: [new SimpleSpanProcessor(fallbackExporter)]
+      })
+
+      const fallbackInstrumentation = new FastifyInstrumentation()
+      fallbackInstrumentation.setTracerProvider(fallbackProvider)
+
+      const app = Fastify()
+      const plugin = fallbackInstrumentation.plugin()
+
+      await app.register(plugin)
+
+      app.get('/', async (request, reply) => 'hello world')
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/'
+      })
+
+      const spans = fallbackExporter.getFinishedSpans()
+
+      // Verify spans were created
+      assert.equal(spans.length, 2)
+
+      // Verify service name comes from resource with proper OpenTelemetry fallback
+      // Should be "unknown_service:" + process.executable.name (host-agnostic check)
+      const [end, start] = spans
+      const serviceName = start.resource.attributes['service.name']
+      assert.ok(serviceName.startsWith('unknown_service:'), `Expected service name to start with 'unknown_service:', got: ${serviceName}`)
+      assert.ok(serviceName.includes('node'), `Expected service name to contain 'node', got: ${serviceName}`)
+      assert.equal(start.resource.attributes['service.name'], end.resource.attributes['service.name'])
+
+      // Verify service.name is NOT in span attributes (should only be in resource)
+      assert.equal('service.name' in start.attributes, false)
+      assert.equal('service.name' in end.attributes, false)
+
+      assert.equal(response.statusCode, 200)
+      assert.equal(response.payload, 'hello world')
     })
   })
 })

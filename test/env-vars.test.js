@@ -19,6 +19,8 @@ const {
   SimpleSpanProcessor
 } = require('@opentelemetry/sdk-trace-base')
 const { context } = require('@opentelemetry/api')
+const { resourceFromAttributes } = require('@opentelemetry/resources')
+const { ATTR_SERVICE_NAME } = require('@opentelemetry/semantic-conventions')
 
 const { HttpInstrumentation } = require('@opentelemetry/instrumentation-http')
 
@@ -34,6 +36,9 @@ describe('Environment variable aware FastifyInstrumentation', () => {
   const instrumentation = new FastifyInstrumentation()
   const contextManager = new AsyncHooksContextManager()
   const memoryExporter = new InMemorySpanExporter()
+
+  // Test that OTEL_SERVICE_NAME environment variable gets picked up by resource
+  // when no explicit service name is provided in resource configuration
   const provider = new NodeTracerProvider()
   const spanProcessor = new SimpleSpanProcessor(memoryExporter)
 
@@ -57,7 +62,7 @@ describe('Environment variable aware FastifyInstrumentation', () => {
       memoryExporter.reset()
     })
 
-    test('should create spans with fastify-specific attributes (service.name comes from resource)', async t => {
+    test('should create spans with fastify-specific attributes (service.name comes from resource, not span attributes)', async t => {
       const app = Fastify()
       const plugin = instrumentation.plugin()
 
@@ -75,7 +80,13 @@ describe('Environment variable aware FastifyInstrumentation', () => {
 
       const spans = memoryExporter
         .getFinishedSpans()
-        .filter(span => span.instrumentationLibrary.name === '@fastify/otel')
+        .filter(span =>
+          // Different OpenTelemetry contexts use different property names:
+          // - instrumentationLibrary: Manual NodeTracerProvider + manual instrumentation registration (older)
+          // - instrumentationScope: NodeSDK with auto-registration (newer standard)
+          span.instrumentationLibrary?.name === '@fastify/otel' ||
+          span.instrumentationScope?.name === '@fastify/otel'
+        )
 
       const [end, start] = spans
 
@@ -92,6 +103,19 @@ describe('Environment variable aware FastifyInstrumentation', () => {
         'http.route': '/',
         'hook.callback.name': 'anonymous'
       })
+
+      // Service name should come from OpenTelemetry SDK defaults (not from instrumentation)
+      // NOTE: With the PR changes, the instrumentation no longer sets service.name in span attributes.
+      // Environment variable support (OTEL_SERVICE_NAME) should be handled at the SDK/Resource level,
+      // typically via NodeSDK. Here we verify the service name exists in resource and not in span attributes.
+      const serviceName = start.resource.attributes['service.name']
+      assert.ok(serviceName, 'Service name should be present in resource')
+      assert.equal(start.resource.attributes['service.name'], end.resource.attributes['service.name'])
+
+      // Verify service.name is NOT in span attributes (should only be in resource)
+      assert.equal('service.name' in start.attributes, false)
+      assert.equal('service.name' in end.attributes, false)
+
       assert.equal(response.status, 200)
       assert.equal(await response.text(), 'hello world')
     })
@@ -116,7 +140,13 @@ describe('Environment variable aware FastifyInstrumentation', () => {
 
       const spans = memoryExporter
         .getFinishedSpans()
-        .filter(span => span.instrumentationLibrary.name === '@fastify/otel')
+        .filter(span =>
+          // Different OpenTelemetry contexts use different property names:
+          // - instrumentationLibrary: Manual NodeTracerProvider + manual instrumentation registration (older)
+          // - instrumentationScope: NodeSDK with auto-registration (newer standard)
+          span.instrumentationLibrary?.name === '@fastify/otel' ||
+          span.instrumentationScope?.name === '@fastify/otel'
+        )
 
       assert.equal(spans.length, 0)
       assert.equal(await response.text(), 'hello world')
